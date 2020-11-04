@@ -844,6 +844,7 @@ static int ovs_ct_nat_execute(struct sk_buff *skb, struct nf_conn *ct,
 			}
 		}
 		/* Non-ICMP, fall thru to initialize if needed. */
+		/* fall through */
 	case IP_CT_NEW:
 		/* Seen it before?  This can happen for loopback, retrans,
 		 * or local packets.
@@ -976,6 +977,17 @@ static int ovs_ct_nat(struct net *net, struct sw_flow_key *key,
 		return NF_ACCEPT; /* Connection is not NATed. */
 	}
 	err = ovs_ct_nat_execute(skb, ct, ctinfo, &info->range, maniptype);
+
+	if (err == NF_ACCEPT &&
+	    ct->status & IPS_SRC_NAT && ct->status & IPS_DST_NAT) {
+		if (maniptype == NF_NAT_MANIP_SRC)
+			maniptype = NF_NAT_MANIP_DST;
+		else
+			maniptype = NF_NAT_MANIP_SRC;
+
+		err = ovs_ct_nat_execute(skb, ct, ctinfo, &info->range,
+					 maniptype);
+	}
 
 	/* Mark NAT done if successful and update the flow key. */
 	if (err == NF_ACCEPT)
@@ -2312,7 +2324,9 @@ static struct genl_ops ct_limit_genl_ops[] = {
 #endif
 		.flags = GENL_ADMIN_PERM, /* Requires CAP_NET_ADMIN
 					   * privilege. */
+#ifdef HAVE_GENL_OPS_POLICY
 		.policy = ct_limit_policy,
+#endif
 		.doit = ovs_ct_limit_cmd_set,
 	},
 	{ .cmd = OVS_CT_LIMIT_CMD_DEL,
@@ -2321,7 +2335,9 @@ static struct genl_ops ct_limit_genl_ops[] = {
 #endif
 		.flags = GENL_ADMIN_PERM, /* Requires CAP_NET_ADMIN
 					   * privilege. */
+#ifdef HAVE_GENL_OPS_POLICY
 		.policy = ct_limit_policy,
+#endif
 		.doit = ovs_ct_limit_cmd_del,
 	},
 	{ .cmd = OVS_CT_LIMIT_CMD_GET,
@@ -2329,7 +2345,9 @@ static struct genl_ops ct_limit_genl_ops[] = {
 		.validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
 #endif
 		.flags = 0,		  /* OK for unprivileged users. */
+#ifdef HAVE_GENL_OPS_POLICY
 		.policy = ct_limit_policy,
+#endif
 		.doit = ovs_ct_limit_cmd_get,
 	},
 };
@@ -2343,6 +2361,9 @@ struct genl_family dp_ct_limit_genl_family __ro_after_init = {
 	.name = OVS_CT_LIMIT_FAMILY,
 	.version = OVS_CT_LIMIT_VERSION,
 	.maxattr = OVS_CT_LIMIT_ATTR_MAX,
+#ifndef HAVE_GENL_OPS_POLICY
+	.policy = ct_limit_policy,
+#endif
 	.netnsok = true,
 	.parallel_ops = true,
 	.ops = ct_limit_genl_ops,

@@ -13,7 +13,7 @@
 # limitations under the License.
 
 AC_PREREQ(2.63)
-AC_INIT(openvswitch, 2.13.90, bugs@openvswitch.org)
+AC_INIT(openvswitch, 2.14.90, bugs@openvswitch.org)
 AC_CONFIG_SRCDIR([datapath/datapath.c])
 AC_CONFIG_MACRO_DIR([m4])
 AC_CONFIG_AUX_DIR([build-aux])
@@ -100,6 +100,7 @@ OVS_CHECK_IF_DL
 OVS_CHECK_STRTOK_R
 OVS_CHECK_LINUX_AF_XDP
 AC_CHECK_DECLS([sys_siglist], [], [], [[#include <signal.h>]])
+AC_CHECK_DECLS([malloc_trim], [], [], [[#include <malloc.h>]])
 AC_CHECK_MEMBERS([struct stat.st_mtim.tv_nsec, struct stat.st_mtimensec],
   [], [], [[#include <sys/stat.h>]])
 AC_CHECK_MEMBERS([struct ifreq.ifr_flagshigh], [], [], [[#include <net/if.h>]])
@@ -178,9 +179,13 @@ OVS_ENABLE_OPTION([-Wno-null-pointer-arithmetic])
 OVS_ENABLE_OPTION([-Warray-bounds-pointer-arithmetic])
 OVS_CONDITIONAL_CC_OPTION([-Wno-unused], [HAVE_WNO_UNUSED])
 OVS_CONDITIONAL_CC_OPTION([-Wno-unused-parameter], [HAVE_WNO_UNUSED_PARAMETER])
+OVS_CONDITIONAL_CC_OPTION([-mavx512f], [HAVE_AVX512F])
+OVS_CHECK_CC_OPTION([-mavx512f], [CFLAGS="$CFLAGS -DHAVE_AVX512F"])
 OVS_ENABLE_WERROR
 OVS_ENABLE_SPARSE
 OVS_CTAGS_IDENTIFIERS
+OVS_CHECK_DPCLS_AUTOVALIDATOR
+OVS_CHECK_BINUTILS_AVX512
 
 AC_ARG_VAR(KARCH, [Kernel Architecture String])
 AC_SUBST(KARCH)
@@ -188,6 +193,7 @@ OVS_CHECK_LINUX
 OVS_CHECK_LINUX_NETLINK
 OVS_CHECK_LINUX_TC
 OVS_CHECK_LINUX_SCTP_CT
+OVS_CHECK_LINUX_VIRTIO_TYPES
 OVS_CHECK_DPDK
 OVS_CHECK_PRAGMA_MESSAGE
 AC_SUBST([OVS_CFLAGS])

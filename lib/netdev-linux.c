@@ -119,10 +119,6 @@ COVERAGE_DEFINE(netdev_set_ethtool);
 #define TC_RTAB_SIZE 1024
 #endif
 
-#ifndef TCM_IFINDEX_MAGIC_BLOCK
-#define TCM_IFINDEX_MAGIC_BLOCK (0xFFFFFFFFU)
-#endif
-
 /* Linux 2.6.21 introduced struct tpacket_auxdata.
  * Linux 2.6.27 added the tp_vlan_tci member.
  * Linux 3.0 defined TP_STATUS_VLAN_VALID.
@@ -231,6 +227,14 @@ struct rtnl_link_stats64 {
     uint64_t tx_compressed;
 };
 
+/* Linux 3.19 introduced virtio_types.h.  It might be missing
+ * if we are using old kernel. */
+#ifndef HAVE_VIRTIO_TYPES
+typedef __u16 __bitwise__ __virtio16;
+typedef __u32 __bitwise__ __virtio32;
+typedef __u64 __bitwise__ __virtio64;
+#endif
+
 enum {
     VALID_IFINDEX           = 1 << 0,
     VALID_ETHERADDR         = 1 << 1,
@@ -253,15 +257,15 @@ enum {
     IOV_AUXBUF = 1,
 };
 
-struct linux_lag_slave {
+struct linux_lag_member {
    uint32_t block_id;
    struct shash_node *node;
 };
 
-/* Protects 'lag_shash' and the mutable members of struct linux_lag_slave. */
+/* Protects 'lag_shash' and the mutable members of struct linux_lag_member. */
 static struct ovs_mutex lag_mutex = OVS_MUTEX_INITIALIZER;
 
-/* All slaves whose LAG masters are network devices in OvS. */
+/* All members whose LAG primary interfaces are OVS network devices. */
 static struct shash lag_shash OVS_GUARDED_BY(lag_mutex)
     = SHASH_INITIALIZER(&lag_shash);
 
@@ -657,13 +661,9 @@ static void
 netdev_linux_update_lag(struct rtnetlink_change *change)
     OVS_REQUIRES(lag_mutex)
 {
-    struct linux_lag_slave *lag;
+    struct linux_lag_member *lag;
 
-    if (!rtnetlink_type_is_rtnlgrp_link(change->nlmsg_type)) {
-        return;
-    }
-
-    if (change->slave && netdev_linux_kind_is_lag(change->slave)) {
+    if (change->sub && netdev_linux_kind_is_lag(change->sub)) {
         lag = shash_find_data(&lag_shash, change->ifname);
 
         if (!lag) {
@@ -691,12 +691,12 @@ netdev_linux_update_lag(struct rtnetlink_change *change)
 
                 /* delete ingress block in case it exists */
                 tc_add_del_qdisc(change->if_index, false, 0, TC_INGRESS);
-                /* LAG master is linux netdev so add slave to same block. */
+                /* LAG master is linux netdev so add member to same block. */
                 error = tc_add_del_qdisc(change->if_index, true, block_id,
                                          TC_INGRESS);
                 if (error) {
-                    VLOG_WARN("failed to bind LAG slave %s to master's block",
-                              change->ifname);
+                    VLOG_WARN("failed to bind LAG member %s to "
+                              "primary's block", change->ifname);
                     shash_delete(&lag_shash, lag->node);
                     free(lag);
                 }
@@ -705,7 +705,7 @@ netdev_linux_update_lag(struct rtnetlink_change *change)
             netdev_close(master_netdev);
         }
     } else if (change->master_ifindex == 0) {
-        /* Check if this was a lag slave that has been freed. */
+        /* Check if this was a lag member that has been removed. */
         lag = shash_find_data(&lag_shash, change->ifname);
 
         if (lag) {
@@ -760,8 +760,11 @@ netdev_linux_run(const struct netdev_class *netdev_class OVS_UNUSED)
                     netdev_linux_update(netdev, nsid, &change);
                     ovs_mutex_unlock(&netdev->mutex);
                 }
-                else if (!netdev_ && change.ifname) {
-                    /* Netdev is not present in OvS but its master could be. */
+
+                if (change.ifname &&
+                    rtnetlink_type_is_rtnlgrp_link(change.nlmsg_type)) {
+
+                    /* Need to try updating the LAG information. */
                     ovs_mutex_lock(&lag_mutex);
                     netdev_linux_update_lag(&change);
                     ovs_mutex_unlock(&lag_mutex);
@@ -857,7 +860,7 @@ netdev_linux_update__(struct netdev_linux *dev,
                 rtnetlink_report_link();
             }
 
-            if (change->master && netdev_linux_kind_is_lag(change->master)) {
+            if (change->primary && netdev_linux_kind_is_lag(change->primary)) {
                 dev->is_lag_master = true;
             }
 
@@ -2212,18 +2215,6 @@ netdev_linux_get_stats(const struct netdev *netdev_,
         /* stats not available from OVS then use netdev stats. */
         *stats = dev_stats;
     } else {
-        /* Use kernel netdev's packet and byte counts since vport's counters
-         * do not reflect packet counts on the wire when GSO, TSO or GRO are
-         * enabled. */
-        stats->rx_packets = dev_stats.rx_packets;
-        stats->rx_bytes = dev_stats.rx_bytes;
-        stats->tx_packets = dev_stats.tx_packets;
-        stats->tx_bytes = dev_stats.tx_bytes;
-
-        stats->rx_errors           += dev_stats.rx_errors;
-        stats->tx_errors           += dev_stats.tx_errors;
-        stats->rx_dropped          += dev_stats.rx_dropped;
-        stats->tx_dropped          += dev_stats.tx_dropped;
         stats->multicast           += dev_stats.multicast;
         stats->collisions          += dev_stats.collisions;
         stats->rx_length_errors    += dev_stats.rx_length_errors;
@@ -2621,9 +2612,8 @@ tc_add_matchall_policer(struct netdev *netdev, uint32_t kbits_rate,
     uint16_t eth_type = (OVS_FORCE uint16_t) htons(ETH_P_ALL);
     size_t basic_offset, action_offset, inner_offset;
     uint16_t prio = TC_RESERVED_PRIORITY_POLICE;
-    int ifindex, index, err = 0;
+    int ifindex, err = 0;
     struct tc_police pol_act;
-    uint32_t block_id = 0;
     struct ofpbuf request;
     struct ofpbuf *reply;
     struct tcmsg *tcmsg;
@@ -2634,10 +2624,9 @@ tc_add_matchall_policer(struct netdev *netdev, uint32_t kbits_rate,
         return err;
     }
 
-    index = block_id ? TCM_IFINDEX_MAGIC_BLOCK : ifindex;
-    tcmsg = tc_make_request(index, RTM_NEWTFILTER, NLM_F_CREATE | NLM_F_ECHO,
+    tcmsg = tc_make_request(ifindex, RTM_NEWTFILTER, NLM_F_CREATE | NLM_F_ECHO,
                             &request);
-    tcmsg->tcm_parent = block_id ? : TC_INGRESS_PARENT;
+    tcmsg->tcm_parent = TC_INGRESS_PARENT;
     tcmsg->tcm_info = tc_make_handle(prio, eth_type);
     tcmsg->tcm_handle = handle;
 
@@ -3605,24 +3594,34 @@ const struct netdev_class netdev_internal_class = {
 };
 
 #ifdef HAVE_AF_XDP
+#define NETDEV_AFXDP_CLASS_COMMON                               \
+    .init = netdev_afxdp_init,                                  \
+    .construct = netdev_afxdp_construct,                        \
+    .destruct = netdev_afxdp_destruct,                          \
+    .get_stats = netdev_afxdp_get_stats,                        \
+    .get_custom_stats = netdev_afxdp_get_custom_stats,          \
+    .get_status = netdev_linux_get_status,                      \
+    .set_config = netdev_afxdp_set_config,                      \
+    .get_config = netdev_afxdp_get_config,                      \
+    .reconfigure = netdev_afxdp_reconfigure,                    \
+    .get_numa_id = netdev_linux_get_numa_id,                    \
+    .send = netdev_afxdp_batch_send,                            \
+    .rxq_construct = netdev_afxdp_rxq_construct,                \
+    .rxq_destruct = netdev_afxdp_rxq_destruct,                  \
+    .rxq_recv = netdev_afxdp_rxq_recv
+
 const struct netdev_class netdev_afxdp_class = {
     NETDEV_LINUX_CLASS_COMMON,
+    NETDEV_AFXDP_CLASS_COMMON,
     .type = "afxdp",
     .is_pmd = true,
-    .init = netdev_afxdp_init,
-    .construct = netdev_afxdp_construct,
-    .destruct = netdev_afxdp_destruct,
-    .get_stats = netdev_afxdp_get_stats,
-    .get_custom_stats = netdev_afxdp_get_custom_stats,
-    .get_status = netdev_linux_get_status,
-    .set_config = netdev_afxdp_set_config,
-    .get_config = netdev_afxdp_get_config,
-    .reconfigure = netdev_afxdp_reconfigure,
-    .get_numa_id = netdev_linux_get_numa_id,
-    .send = netdev_afxdp_batch_send,
-    .rxq_construct = netdev_afxdp_rxq_construct,
-    .rxq_destruct = netdev_afxdp_rxq_destruct,
-    .rxq_recv = netdev_afxdp_rxq_recv,
+};
+
+const struct netdev_class netdev_afxdp_nonpmd_class = {
+    NETDEV_LINUX_CLASS_COMMON,
+    NETDEV_AFXDP_CLASS_COMMON,
+    .type = "afxdp-nonpmd",
+    .is_pmd = false,
 };
 #endif
 
@@ -6377,7 +6376,7 @@ netdev_linux_update_via_netlink(struct netdev_linux *netdev)
             netdev->get_ifindex_error = 0;
             changed = true;
         }
-        if (change->master && netdev_linux_kind_is_lag(change->master)) {
+        if (change->primary && netdev_linux_kind_is_lag(change->primary)) {
             netdev->is_lag_master = true;
         }
         if (changed) {

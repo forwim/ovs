@@ -245,6 +245,7 @@ enum ovs_vport_type {
 	OVS_VPORT_TYPE_ERSPAN = 107, /* ERSPAN tunnel. */
 	OVS_VPORT_TYPE_IP6ERSPAN = 108, /* ERSPAN tunnel. */
 	OVS_VPORT_TYPE_IP6GRE = 109,
+	OVS_VPORT_TYPE_GTPU = 110,
 	__OVS_VPORT_TYPE_MAX
 };
 
@@ -404,6 +405,10 @@ enum ovs_tunnel_key_attr {
 	OVS_TUNNEL_KEY_ATTR_IPV6_DST,		/* struct in6_addr dst IPv6 address. */
 	OVS_TUNNEL_KEY_ATTR_PAD,
 	OVS_TUNNEL_KEY_ATTR_ERSPAN_OPTS,	/* struct erspan_metadata */
+#ifndef __KERNEL__
+	/* Only used within userspace data path. */
+	OVS_TUNNEL_KEY_ATTR_GTPU_OPTS,		/* struct gtpu_metadata */
+#endif
 	__OVS_TUNNEL_KEY_ATTR_MAX
 };
 
@@ -1021,6 +1026,7 @@ enum ovs_action_attr {
 	OVS_ACTION_ATTR_TUNNEL_PUSH,   /* struct ovs_action_push_tnl*/
 	OVS_ACTION_ATTR_TUNNEL_POP,    /* u32 port number. */
 	OVS_ACTION_ATTR_DROP,          /* u32 xlate_error. */
+	OVS_ACTION_ATTR_LB_OUTPUT,     /* u32 bond-id. */
 #endif
 	__OVS_ACTION_ATTR_MAX,	      /* Nothing past this will be accepted
 				       * from userspace. */

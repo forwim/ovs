@@ -154,6 +154,7 @@ netdev_initialize(void)
         netdev_register_flow_api_provider(&netdev_offload_tc);
 #ifdef HAVE_AF_XDP
         netdev_register_provider(&netdev_afxdp_class);
+        netdev_register_provider(&netdev_afxdp_nonpmd_class);
 #endif
 #endif
 #if defined(__FreeBSD__) || defined(__NetBSD__)
@@ -1981,6 +1982,22 @@ const struct netdev_class *
 netdev_get_class(const struct netdev *netdev)
 {
     return netdev->netdev_class;
+}
+
+/* Set the type of 'dpif' this 'netdev' belongs to. */
+void
+netdev_set_dpif_type(struct netdev *netdev, const char *type)
+{
+    netdev->dpif_type = type;
+}
+
+/* Returns the type of 'dpif' this 'netdev' belongs to.
+ *
+ * The caller must not free the returned value. */
+const char *
+netdev_get_dpif_type(const struct netdev *netdev)
+{
+    return netdev->dpif_type;
 }
 
 /* Returns the netdev with 'name' or NULL if there is none.

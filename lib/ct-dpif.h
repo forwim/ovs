@@ -59,6 +59,8 @@ struct ct_dpif_timestamp {
     uint64_t stop;
 };
 
+#define DEFAULT_TP_ID 0
+
 #define CT_DPIF_TCP_STATES \
     CT_DPIF_TCP_STATE(CLOSED) \
     CT_DPIF_TCP_STATE(LISTEN) \
@@ -175,7 +177,7 @@ struct ct_dpif_entry {
     /* Const members. */
     struct ct_dpif_tuple tuple_orig;
     struct ct_dpif_tuple tuple_reply;
-    struct ct_dpif_tuple tuple_master;
+    struct ct_dpif_tuple tuple_parent;
     struct ct_dpif_helper helper;
     uint32_t id;
     uint16_t zone;

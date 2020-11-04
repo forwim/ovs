@@ -76,8 +76,12 @@ static char *ssl_protocols;
 static char *ssl_ciphers;
 static bool bootstrap_ca_cert;
 
+/* Try to reclaim heap memory back to system after DB compaction. */
+static bool trim_memory = false;
+
 static unixctl_cb_func ovsdb_server_exit;
 static unixctl_cb_func ovsdb_server_compact;
+static unixctl_cb_func ovsdb_server_memory_trim_on_compaction;
 static unixctl_cb_func ovsdb_server_reconnect;
 static unixctl_cb_func ovsdb_server_perf_counters_clear;
 static unixctl_cb_func ovsdb_server_perf_counters_show;
@@ -90,6 +94,7 @@ static unixctl_cb_func ovsdb_server_set_active_ovsdb_server_probe_interval;
 static unixctl_cb_func ovsdb_server_set_sync_exclude_tables;
 static unixctl_cb_func ovsdb_server_get_sync_exclude_tables;
 static unixctl_cb_func ovsdb_server_get_sync_status;
+static unixctl_cb_func ovsdb_server_get_db_storage_status;
 
 struct server_config {
     struct sset *remotes;
@@ -242,7 +247,7 @@ main_loop(struct server_config *config,
                           xasprintf("removing database %s because storage "
                                     "disconnected permanently", node->name));
             } else if (ovsdb_storage_should_snapshot(db->db->storage)) {
-                log_and_free_error(ovsdb_snapshot(db->db));
+                log_and_free_error(ovsdb_snapshot(db->db, trim_memory));
             }
         }
         if (run_process) {
@@ -409,6 +414,9 @@ main(int argc, char *argv[])
     unixctl_command_register("exit", "", 0, 0, ovsdb_server_exit, &exiting);
     unixctl_command_register("ovsdb-server/compact", "", 0, 1,
                              ovsdb_server_compact, &all_dbs);
+    unixctl_command_register("ovsdb-server/memory-trim-on-compaction",
+                             "on|off", 1, 1,
+                             ovsdb_server_memory_trim_on_compaction, NULL);
     unixctl_command_register("ovsdb-server/reconnect", "", 0, 0,
                              ovsdb_server_reconnect, jsonrpc);
 
@@ -452,6 +460,9 @@ main(int argc, char *argv[])
                              NULL);
     unixctl_command_register("ovsdb-server/sync-status", "",
                              0, 0, ovsdb_server_get_sync_status,
+                             &server_config);
+    unixctl_command_register("ovsdb-server/get-db-storage-status", "DB", 1, 1,
+                             ovsdb_server_get_db_storage_status,
                              &server_config);
 
     /* Simulate the behavior of OVS release prior to version 2.5 that
@@ -540,7 +551,7 @@ close_db(struct server_config *config, struct db *db, char *comment)
 
 static struct ovsdb_error * OVS_WARN_UNUSED_RESULT
 parse_txn(struct server_config *config, struct db *db,
-          struct ovsdb_schema *schema, const struct json *txn_json,
+          const struct ovsdb_schema *schema, const struct json *txn_json,
           const struct uuid *txnid)
 {
     if (schema) {
@@ -548,7 +559,9 @@ parse_txn(struct server_config *config, struct db *db,
          * (first grabbing its storage), then replace it with the new schema.
          * The transaction must also include the replacement data.
          *
-         * Only clustered database schema changes go through this path. */
+         * Only clustered database schema changes and snapshot installs
+         * go through this path.
+         */
         ovs_assert(txn_json);
         ovs_assert(ovsdb_storage_is_clustered(db->db->storage));
 
@@ -558,13 +571,17 @@ parse_txn(struct server_config *config, struct db *db,
             return error;
         }
 
-        ovsdb_jsonrpc_server_reconnect(
-            config->jsonrpc, false,
-            (db->db->schema
-             ? xasprintf("database %s schema changed", db->db->name)
-             : xasprintf("database %s connected to storage", db->db->name)));
+        if (!db->db->schema ||
+            strcmp(schema->version, db->db->schema->version)) {
+            ovsdb_jsonrpc_server_reconnect(
+                config->jsonrpc, false,
+                (db->db->schema
+                ? xasprintf("database %s schema changed", db->db->name)
+                : xasprintf("database %s connected to storage",
+                            db->db->name)));
+        }
 
-        ovsdb_replace(db->db, ovsdb_create(schema, NULL));
+        ovsdb_replace(db->db, ovsdb_create(ovsdb_schema_clone(schema), NULL));
 
         /* Force update to schema in _Server database. */
         db->row_uuid = UUID_ZERO;
@@ -613,6 +630,7 @@ read_db(struct server_config *config, struct db *db)
         } else {
             error = parse_txn(config, db, schema, txn_json, &txnid);
             json_destroy(txn_json);
+            ovsdb_schema_destroy(schema);
             if (error) {
                 break;
             }
@@ -1380,7 +1398,7 @@ ovsdb_server_set_sync_exclude_tables(struct unixctl_conn *conn,
 {
     struct server_config *config = config_;
 
-    char *err = set_blacklist_tables(argv[1], true);
+    char *err = set_excluded_tables(argv[1], true);
     if (!err) {
         free(*config->sync_exclude);
         *config->sync_exclude = xstrdup(argv[1]);
@@ -1392,7 +1410,7 @@ ovsdb_server_set_sync_exclude_tables(struct unixctl_conn *conn,
                                    config->all_dbs, server_uuid,
                                    *config->replication_probe_interval);
         }
-        err = set_blacklist_tables(argv[1], false);
+        err = set_excluded_tables(argv[1], false);
     }
     unixctl_command_reply(conn, err);
     free(err);
@@ -1404,7 +1422,7 @@ ovsdb_server_get_sync_exclude_tables(struct unixctl_conn *conn,
                                      const char *argv[] OVS_UNUSED,
                                      void *arg_ OVS_UNUSED)
 {
-    char *reply = get_blacklist_tables();
+    char *reply = get_excluded_tables();
     unixctl_command_reply(conn, reply);
     free(reply);
 }
@@ -1481,7 +1499,8 @@ ovsdb_server_compact(struct unixctl_conn *conn, int argc,
                 VLOG_INFO("compacting %s database by user request",
                           node->name);
 
-                struct ovsdb_error *error = ovsdb_snapshot(db->db);
+                struct ovsdb_error *error = ovsdb_snapshot(db->db,
+                                                           trim_memory);
                 if (error) {
                     char *s = ovsdb_error_to_string(error);
                     ds_put_format(&reply, "%s\n", s);
@@ -1502,6 +1521,35 @@ ovsdb_server_compact(struct unixctl_conn *conn, int argc,
         unixctl_command_reply(conn, NULL);
     }
     ds_destroy(&reply);
+}
+
+/* "ovsdb-server/memory-trim-on-compaction": controls whether ovsdb-server
+ * tries to reclaim heap memory back to system using malloc_trim() after
+ * compaction.  */
+static void
+ovsdb_server_memory_trim_on_compaction(struct unixctl_conn *conn,
+                                       int argc OVS_UNUSED,
+                                       const char *argv[],
+                                       void *arg OVS_UNUSED)
+{
+    const char *command = argv[1];
+
+#if !HAVE_DECL_MALLOC_TRIM
+    unixctl_command_reply_error(conn, "memory trimming is not supported");
+    return;
+#endif
+
+    if (!strcmp(command, "on")) {
+        trim_memory = true;
+    } else if (!strcmp(command, "off")) {
+        trim_memory = false;
+    } else {
+        unixctl_command_reply_error(conn, "invalid argument");
+        return;
+    }
+    VLOG_INFO("memory trimming after compaction %s.",
+              trim_memory ? "enabled" : "disabled");
+    unixctl_command_reply(conn, NULL);
 }
 
 /* "ovsdb-server/reconnect": makes ovsdb-server drop all of its JSON-RPC
@@ -1695,6 +1743,41 @@ ovsdb_server_get_sync_status(struct unixctl_conn *conn, int argc OVS_UNUSED,
 }
 
 static void
+ovsdb_server_get_db_storage_status(struct unixctl_conn *conn,
+                                   int argc OVS_UNUSED,
+                                   const char *argv[],
+                                   void *config_)
+{
+    struct server_config *config = config_;
+    struct shash_node *node;
+
+    node = shash_find(config->all_dbs, argv[1]);
+    if (!node) {
+        unixctl_command_reply_error(conn, "Failed to find the database.");
+        return;
+    }
+
+    struct db *db = node->data;
+
+    if (!db->db) {
+        unixctl_command_reply_error(conn, "Failed to find the database.");
+        return;
+    }
+
+    struct ds ds = DS_EMPTY_INITIALIZER;
+    char *error = ovsdb_storage_get_error(db->db->storage);
+
+    if (!error) {
+        ds_put_cstr(&ds, "status: ok");
+    } else {
+        ds_put_format(&ds, "status: %s", error);
+        free(error);
+    }
+    unixctl_command_reply(conn, ds_cstr(&ds));
+    ds_destroy(&ds);
+}
+
+static void
 parse_options(int argc, char *argv[],
               struct sset *db_filenames, struct sset *remotes,
               char **unixctl_pathp, char **run_command,
@@ -1807,7 +1890,7 @@ parse_options(int argc, char *argv[],
             break;
 
         case OPT_SYNC_EXCLUDE: {
-            char *err = set_blacklist_tables(optarg, false);
+            char *err = set_excluded_tables(optarg, false);
             if (err) {
                 ovs_fatal(0, "%s", err);
             }

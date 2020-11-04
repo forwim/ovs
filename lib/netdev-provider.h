@@ -96,7 +96,8 @@ struct netdev {
 
     /* Functions to control flow offloading. */
     OVSRCU_TYPE(const struct netdev_flow_api *) flow_api;
-    struct netdev_hw_info hw_info;	/* offload-capable netdev info */
+    const char *dpif_type;          /* Type of dpif this netdev belongs to. */
+    struct netdev_hw_info hw_info;  /* Offload-capable netdev info. */
 };
 
 static inline void
@@ -850,6 +851,7 @@ extern const struct netdev_class netdev_tap_class;
 
 #ifdef HAVE_AF_XDP
 extern const struct netdev_class netdev_afxdp_class;
+extern const struct netdev_class netdev_afxdp_nonpmd_class;
 #endif
 #ifdef  __cplusplus
 }

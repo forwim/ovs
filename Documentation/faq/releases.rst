@@ -67,9 +67,12 @@ Q: What Linux kernel versions does each Open vSwitch release work with?
     2.7.x        3.10 to 4.9
     2.8.x        3.10 to 4.12
     2.9.x        3.10 to 4.13
-    2.10.x       3.10 to 4.17
-    2.11.x       3.10 to 4.18
-    2.12.x       3.10 to 5.0
+    2.10.x       3.16 to 4.17
+    2.11.x       3.16 to 4.18
+    2.12.x       3.16 to 5.0
+    2.13.x       3.16 to 5.0
+    2.14.x       3.16 to 5.5
+    2.15.x       3.16 to 5.8
     ============ ==============
 
     Open vSwitch userspace should also work with the Linux kernel module built
@@ -77,6 +80,10 @@ Q: What Linux kernel versions does each Open vSwitch release work with?
 
     Open vSwitch userspace is not sensitive to the Linux kernel version.  It
     should build against almost any kernel, certainly against 2.6.32 and later.
+
+    Open vSwitch branches 2.10 through 2.14 will still compile against the
+    RHEL and CentOS 7 3.10 based kernels since they have diverged from the
+    Linux kernel.org 3.10 kernels.
 
 Q: Are all features available with all datapaths?
 
@@ -117,7 +124,7 @@ Q: Are all features available with all datapaths?
     ========================== ============== ============== ========= =======
     Connection tracking             4.3            2.5          2.6      YES
     Conntrack Fragment Reass.       4.3            2.6          2.12     YES
-    Conntrack Timeout Policies      5.2            2.12         NO       NO
+    Conntrack Timeout Policies      5.2            2.12         2.14     NO
     Conntrack Zone Limit            4.18           2.10         2.13     YES
     Conntrack NAT                   4.6            2.6          2.8      YES
     Tunnel - LISP                   NO             2.11         NO       NO
@@ -130,6 +137,7 @@ Q: Are all features available with all datapaths?
     Tunnel - Geneve-IPv6            4.4            2.6          2.6      NO
     Tunnel - ERSPAN                 4.18           2.10         2.10     NO
     Tunnel - ERSPAN-IPv6            4.18           2.10         2.10     NO
+    Tunnel - GTP-U                  NO             NO           2.14     NO
     QoS - Policing                  YES            1.1          2.6      NO
     QoS - Shaping                   YES            1.1          NO       NO
     sFlow                           YES            1.0          1.0      NO
@@ -138,6 +146,7 @@ Q: Are all features available with all datapaths?
     NIC Bonding                     YES            1.0          1.0      YES
     Multiple VTEPs                  YES            1.10         1.10     YES
     Meter action                    4.15           2.10         2.7      NO
+    check_pkt_len action            5.2            2.12         2.12     NO
     ========================== ============== ============== ========= =======
 
     Do note, however:
@@ -173,9 +182,9 @@ Q: What DPDK version does each Open vSwitch release work with?
     A: The following table lists the DPDK version against which the given
     versions of Open vSwitch will successfully build.
 
-    ============ =======
+    ============ ========
     Open vSwitch DPDK
-    ============ =======
+    ============ ========
     2.2.x        1.6
     2.3.x        1.6
     2.4.x        2.0
@@ -183,12 +192,13 @@ Q: What DPDK version does each Open vSwitch release work with?
     2.6.x        16.07.2
     2.7.x        16.11.9
     2.8.x        17.05.2
-    2.9.x        17.11.4
-    2.10.x       17.11.4
-    2.11.x       18.11.6
-    2.12.x       18.11.6
-    2.13.x       19.11.0
-    ============ =======
+    2.9.x        17.11.10
+    2.10.x       17.11.10
+    2.11.x       18.11.9
+    2.12.x       18.11.9
+    2.13.x       19.11.2
+    2.14.x       19.11.2
+    ============ ========
 
 Q: Are all the DPDK releases that OVS versions work with maintained?
 

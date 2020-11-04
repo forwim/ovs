@@ -25,6 +25,7 @@
 #include "bitmap.h"
 #include "conntrack.h"
 #include "conntrack-private.h"
+#include "conntrack-tp.h"
 #include "coverage.h"
 #include "csum.h"
 #include "ct-dpif.h"
@@ -44,6 +45,7 @@ VLOG_DEFINE_THIS_MODULE(conntrack);
 
 COVERAGE_DEFINE(conntrack_full);
 COVERAGE_DEFINE(conntrack_long_cleanup);
+COVERAGE_DEFINE(conntrack_l4csum_err);
 
 struct conn_lookup_ctx {
     struct conn_key key;
@@ -88,7 +90,8 @@ static uint32_t conn_key_hash(const struct conn_key *, uint32_t basis);
 static void conn_key_reverse(struct conn_key *);
 static bool valid_new(struct dp_packet *pkt, struct conn_key *);
 static struct conn *new_conn(struct conntrack *ct, struct dp_packet *pkt,
-                             struct conn_key *, long long now);
+                             struct conn_key *, long long now,
+                             uint32_t tp_id);
 static void delete_conn_cmn(struct conn *);
 static void delete_conn(struct conn *);
 static void delete_conn_one(struct conn *conn);
@@ -141,7 +144,7 @@ detect_ftp_ctl_type(const struct conn_lookup_ctx *ctx,
                     struct dp_packet *pkt);
 
 static void
-expectation_clean(struct conntrack *ct, const struct conn_key *master_key);
+expectation_clean(struct conntrack *ct, const struct conn_key *parent_key);
 
 static struct ct_l4_proto *l4_protos[] = {
     [IPPROTO_TCP] = &ct_proto_tcp,
@@ -173,12 +176,6 @@ static alg_helper alg_helpers[] = {
     [CT_ALG_CTL_NONE] = NULL,
     [CT_ALG_CTL_FTP] = handle_ftp_ctl,
     [CT_ALG_CTL_TFTP] = handle_tftp_ctl,
-};
-
-long long ct_timeout_val[] = {
-#define CT_TIMEOUT(NAME, VAL) [CT_TM_##NAME] = VAL,
-    CT_TIMEOUTS
-#undef CT_TIMEOUT
 };
 
 /* The maximum TCP or UDP port number. */
@@ -312,6 +309,7 @@ conntrack_init(void)
     }
     hmap_init(&ct->zone_limits);
     ct->zone_limit_seq = 0;
+    timeout_policy_init(ct);
     ovs_mutex_unlock(&ct->ct_lock);
 
     ct->hash_basis = random_uint32();
@@ -502,6 +500,12 @@ conntrack_destroy(struct conntrack *ct)
     }
     hmap_destroy(&ct->zone_limits);
 
+    struct timeout_policy *tp;
+    HMAP_FOR_EACH_POP (tp, node, &ct->timeout_policies) {
+        free(tp);
+    }
+    hmap_destroy(&ct->timeout_policies);
+
     ovs_mutex_unlock(&ct->ct_lock);
     ovs_mutex_destroy(&ct->ct_lock);
 
@@ -581,14 +585,14 @@ write_ct_md(struct dp_packet *pkt, uint16_t zone, const struct conn *conn,
     /* Use the original direction tuple if we have it. */
     if (conn) {
         if (conn->alg_related) {
-            key = &conn->master_key;
+            key = &conn->parent_key;
         } else {
             key = &conn->key;
         }
     } else if (alg_exp) {
-        pkt->md.ct_mark = alg_exp->master_mark;
-        pkt->md.ct_label = alg_exp->master_label;
-        key = &alg_exp->master_key;
+        pkt->md.ct_mark = alg_exp->parent_mark;
+        pkt->md.ct_label = alg_exp->parent_label;
+        key = &alg_exp->parent_key;
     }
 
     pkt->md.ct_orig_tuple_ipv6 = false;
@@ -956,7 +960,7 @@ conn_not_found(struct conntrack *ct, struct dp_packet *pkt,
                struct conn_lookup_ctx *ctx, bool commit, long long now,
                const struct nat_action_info_t *nat_action_info,
                const char *helper, const struct alg_exp_node *alg_exp,
-               enum ct_alg_ctl_type ct_alg_ctl)
+               enum ct_alg_ctl_type ct_alg_ctl, uint32_t tp_id)
     OVS_REQUIRES(ct->ct_lock)
 {
     struct conn *nc = NULL;
@@ -987,7 +991,7 @@ conn_not_found(struct conntrack *ct, struct dp_packet *pkt,
             return nc;
         }
 
-        nc = new_conn(ct, pkt, &ctx->key, now);
+        nc = new_conn(ct, pkt, &ctx->key, now, tp_id);
         memcpy(&nc->key, &ctx->key, sizeof nc->key);
         memcpy(&nc->rev_key, &nc->key, sizeof nc->rev_key);
         conn_key_reverse(&nc->rev_key);
@@ -998,9 +1002,9 @@ conn_not_found(struct conntrack *ct, struct dp_packet *pkt,
 
         if (alg_exp) {
             nc->alg_related = true;
-            nc->mark = alg_exp->master_mark;
-            nc->label = alg_exp->master_label;
-            nc->master_key = alg_exp->master_key;
+            nc->mark = alg_exp->parent_mark;
+            nc->label = alg_exp->parent_label;
+            nc->parent_key = alg_exp->parent_key;
         }
 
         if (nat_action_info) {
@@ -1275,8 +1279,14 @@ process_one(struct conntrack *ct, struct dp_packet *pkt,
             bool force, bool commit, long long now, const uint32_t *setmark,
             const struct ovs_key_ct_labels *setlabel,
             const struct nat_action_info_t *nat_action_info,
-            ovs_be16 tp_src, ovs_be16 tp_dst, const char *helper)
+            ovs_be16 tp_src, ovs_be16 tp_dst, const char *helper,
+            uint32_t tp_id)
 {
+    /* Reset ct_state whenever entering a new zone. */
+    if (pkt->md.ct_state && pkt->md.ct_zone != zone) {
+        pkt->md.ct_state = 0;
+    }
+
     bool create_new_conn = false;
     conn_key_lookup(ct, &ctx->key, ctx->hash, now, &ctx->conn, &ctx->reply);
     struct conn *conn = ctx->conn;
@@ -1300,9 +1310,10 @@ process_one(struct conntrack *ct, struct dp_packet *pkt,
             conn_key_lookup(ct, &ctx->key, hash, now, &conn, &ctx->reply);
 
             if (!conn) {
-                pkt->md.ct_state |= CS_TRACKED | CS_INVALID;
-                char *log_msg = xasprintf("Missing master conn %p", rev_conn);
-                ct_print_conn_info(conn, log_msg, VLL_INFO, true, true);
+                pkt->md.ct_state |= CS_INVALID;
+                write_ct_md(pkt, zone, NULL, NULL, NULL);
+                char *log_msg = xasprintf("Missing parent conn %p", rev_conn);
+                ct_print_conn_info(rev_conn, log_msg, VLL_INFO, true, true);
                 free(log_msg);
                 return;
             }
@@ -1353,7 +1364,7 @@ process_one(struct conntrack *ct, struct dp_packet *pkt,
         ovs_mutex_lock(&ct->ct_lock);
         if (!conn_lookup(ct, &ctx->key, now, NULL, NULL)) {
             conn = conn_not_found(ct, pkt, ctx, commit, now, nat_action_info,
-                                  helper, alg_exp, ct_alg_ctl);
+                                  helper, alg_exp, ct_alg_ctl, tp_id);
         }
         ovs_mutex_unlock(&ct->ct_lock);
     }
@@ -1389,7 +1400,7 @@ conntrack_execute(struct conntrack *ct, struct dp_packet_batch *pkt_batch,
                   const struct ovs_key_ct_labels *setlabel,
                   ovs_be16 tp_src, ovs_be16 tp_dst, const char *helper,
                   const struct nat_action_info_t *nat_action_info,
-                  long long now)
+                  long long now, uint32_t tp_id)
 {
     ipf_preprocess_conntrack(ct->ipf, pkt_batch, now, dl_type, zone,
                              ct->hash_basis);
@@ -1411,7 +1422,8 @@ conntrack_execute(struct conntrack *ct, struct dp_packet_batch *pkt_batch,
             write_ct_md(packet, zone, NULL, NULL, NULL);
         } else {
             process_one(ct, packet, &ctx, zone, force, commit, now, setmark,
-                        setlabel, nat_action_info, tp_src, tp_dst, helper);
+                        setlabel, nat_action_info, tp_src, tp_dst, helper,
+                        tp_id);
         }
     }
 
@@ -1517,7 +1529,7 @@ conntrack_clean(struct conntrack *ct, long long now)
     atomic_read_relaxed(&ct->n_conn_limit, &n_conn_limit);
     size_t clean_max = n_conn_limit > 10 ? n_conn_limit / 10 : 1;
     long long min_exp = ct_sweep(ct, now, clean_max);
-    long long next_wakeup = MIN(min_exp, now + CT_TM_MIN);
+    long long next_wakeup = MIN(min_exp, now + CT_DPIF_NETDEV_TP_MIN);
 
     return next_wakeup;
 }
@@ -1655,6 +1667,7 @@ checksum_valid(const struct conn_key *key, const void *data, size_t size,
     } else if (key->dl_type == htons(ETH_TYPE_IPV6)) {
         return packet_csum_upperlayer6(l3, data, key->nw_proto, size) == 0;
     } else {
+        COVERAGE_INC(conntrack_l4csum_err);
         return false;
     }
 }
@@ -1698,7 +1711,12 @@ check_l4_udp(const struct conn_key *key, const void *data, size_t size,
 static inline bool
 check_l4_icmp(const void *data, size_t size, bool validate_checksum)
 {
-    return validate_checksum ? csum(data, size) == 0 : true;
+    if (validate_checksum && csum(data, size) != 0) {
+        COVERAGE_INC(conntrack_l4csum_err);
+        return false;
+    } else {
+        return true;
+    }
 }
 
 static inline bool
@@ -2341,9 +2359,9 @@ valid_new(struct dp_packet *pkt, struct conn_key *key)
 
 static struct conn *
 new_conn(struct conntrack *ct, struct dp_packet *pkt, struct conn_key *key,
-         long long now)
+         long long now, uint32_t tp_id)
 {
-    return l4_protos[key->nw_proto]->new_conn(ct, pkt, now);
+    return l4_protos[key->nw_proto]->new_conn(ct, pkt, now, tp_id);
 }
 
 static void
@@ -2659,16 +2677,16 @@ expectation_remove(struct hmap *alg_expectations,
 /* This function must be called with the ct->resources read lock taken. */
 static struct alg_exp_node *
 expectation_ref_lookup_unique(const struct hindex *alg_expectation_refs,
-                              const struct conn_key *master_key,
+                              const struct conn_key *parent_key,
                               const struct conn_key *alg_exp_key,
                               uint32_t basis)
 {
     struct alg_exp_node *alg_exp_node;
 
     HINDEX_FOR_EACH_WITH_HASH (alg_exp_node, node_ref,
-                               conn_key_hash(master_key, basis),
+                               conn_key_hash(parent_key, basis),
                                alg_expectation_refs) {
-        if (!conn_key_cmp(&alg_exp_node->master_key, master_key) &&
+        if (!conn_key_cmp(&alg_exp_node->parent_key, parent_key) &&
             !conn_key_cmp(&alg_exp_node->key, alg_exp_key)) {
             return alg_exp_node;
         }
@@ -2683,23 +2701,23 @@ expectation_ref_create(struct hindex *alg_expectation_refs,
                        uint32_t basis)
 {
     if (!expectation_ref_lookup_unique(alg_expectation_refs,
-                                       &alg_exp_node->master_key,
+                                       &alg_exp_node->parent_key,
                                        &alg_exp_node->key, basis)) {
         hindex_insert(alg_expectation_refs, &alg_exp_node->node_ref,
-                      conn_key_hash(&alg_exp_node->master_key, basis));
+                      conn_key_hash(&alg_exp_node->parent_key, basis));
     }
 }
 
 static void
-expectation_clean(struct conntrack *ct, const struct conn_key *master_key)
+expectation_clean(struct conntrack *ct, const struct conn_key *parent_key)
 {
     ovs_rwlock_wrlock(&ct->resources_lock);
 
     struct alg_exp_node *node, *next;
     HINDEX_FOR_EACH_WITH_HASH_SAFE (node, next, node_ref,
-                                    conn_key_hash(master_key, ct->hash_basis),
+                                    conn_key_hash(parent_key, ct->hash_basis),
                                     &ct->alg_expectation_refs) {
-        if (!conn_key_cmp(&node->master_key, master_key)) {
+        if (!conn_key_cmp(&node->parent_key, parent_key)) {
             expectation_remove(&ct->alg_expectations, &node->key,
                                ct->hash_basis);
             hindex_remove(&ct->alg_expectation_refs, &node->node_ref);
@@ -2712,7 +2730,7 @@ expectation_clean(struct conntrack *ct, const struct conn_key *master_key)
 
 static void
 expectation_create(struct conntrack *ct, ovs_be16 dst_port,
-                   const struct conn *master_conn, bool reply, bool src_ip_wc,
+                   const struct conn *parent_conn, bool reply, bool src_ip_wc,
                    bool skip_nat)
 {
     union ct_addr src_addr;
@@ -2721,47 +2739,47 @@ expectation_create(struct conntrack *ct, ovs_be16 dst_port,
     struct alg_exp_node *alg_exp_node = xzalloc(sizeof *alg_exp_node);
 
     if (reply) {
-        src_addr = master_conn->key.src.addr;
-        dst_addr = master_conn->key.dst.addr;
+        src_addr = parent_conn->key.src.addr;
+        dst_addr = parent_conn->key.dst.addr;
         alg_exp_node->nat_rpl_dst = true;
         if (skip_nat) {
             alg_nat_repl_addr = dst_addr;
-        } else if (master_conn->nat_info &&
-                   master_conn->nat_info->nat_action & NAT_ACTION_DST) {
-            alg_nat_repl_addr = master_conn->rev_key.src.addr;
+        } else if (parent_conn->nat_info &&
+                   parent_conn->nat_info->nat_action & NAT_ACTION_DST) {
+            alg_nat_repl_addr = parent_conn->rev_key.src.addr;
             alg_exp_node->nat_rpl_dst = false;
         } else {
-            alg_nat_repl_addr = master_conn->rev_key.dst.addr;
+            alg_nat_repl_addr = parent_conn->rev_key.dst.addr;
         }
     } else {
-        src_addr = master_conn->rev_key.src.addr;
-        dst_addr = master_conn->rev_key.dst.addr;
+        src_addr = parent_conn->rev_key.src.addr;
+        dst_addr = parent_conn->rev_key.dst.addr;
         alg_exp_node->nat_rpl_dst = false;
         if (skip_nat) {
             alg_nat_repl_addr = src_addr;
-        } else if (master_conn->nat_info &&
-                   master_conn->nat_info->nat_action & NAT_ACTION_DST) {
-            alg_nat_repl_addr = master_conn->key.dst.addr;
+        } else if (parent_conn->nat_info &&
+                   parent_conn->nat_info->nat_action & NAT_ACTION_DST) {
+            alg_nat_repl_addr = parent_conn->key.dst.addr;
             alg_exp_node->nat_rpl_dst = true;
         } else {
-            alg_nat_repl_addr = master_conn->key.src.addr;
+            alg_nat_repl_addr = parent_conn->key.src.addr;
         }
     }
     if (src_ip_wc) {
         memset(&src_addr, 0, sizeof src_addr);
     }
 
-    alg_exp_node->key.dl_type = master_conn->key.dl_type;
-    alg_exp_node->key.nw_proto = master_conn->key.nw_proto;
-    alg_exp_node->key.zone = master_conn->key.zone;
+    alg_exp_node->key.dl_type = parent_conn->key.dl_type;
+    alg_exp_node->key.nw_proto = parent_conn->key.nw_proto;
+    alg_exp_node->key.zone = parent_conn->key.zone;
     alg_exp_node->key.src.addr = src_addr;
     alg_exp_node->key.dst.addr = dst_addr;
     alg_exp_node->key.src.port = ALG_WC_SRC_PORT;
     alg_exp_node->key.dst.port = dst_port;
-    alg_exp_node->master_mark = master_conn->mark;
-    alg_exp_node->master_label = master_conn->label;
-    memcpy(&alg_exp_node->master_key, &master_conn->key,
-           sizeof alg_exp_node->master_key);
+    alg_exp_node->parent_mark = parent_conn->mark;
+    alg_exp_node->parent_label = parent_conn->label;
+    memcpy(&alg_exp_node->parent_key, &parent_conn->key,
+           sizeof alg_exp_node->parent_key);
     /* Take the write lock here because it is almost 100%
      * likely that the lookup will fail and
      * expectation_create() will be called below. */
